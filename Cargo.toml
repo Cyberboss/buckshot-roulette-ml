@@ -3,4 +3,15 @@ name = "buckshot-roulette-ml"
 version = "0.1.0"
 edition = "2021"
 
+repository = "https://github.com/Cyberboss/buckshot-roulette-ml"
+description = "A machine learning application for the game Buckshot Roulette "
+license = "GPL-3.0-or-later"
+license-file = "LICENSE"
+readme = "README.md"
+
+
 [dependencies]
+buckshot-roulette-gameplay-engine = "1.0.0"
+blas-src = { version = "0.4", features = ["openblas"] }
+openblas-src = "0.7"
+rsrl = { version = "0.8.1", features = ["blas"] }
