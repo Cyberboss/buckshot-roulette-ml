@@ -6,7 +6,6 @@ edition = "2021"
 repository = "https://github.com/Cyberboss/buckshot-roulette-ml"
 description = "A machine learning application for the game Buckshot Roulette "
 license = "GPL-3.0-or-later"
-license-file = "LICENSE"
 readme = "README.md"
 
 
