@@ -82,9 +82,9 @@ checksum = "a25f136d1bcc6fc28330077511a0646aaf75bc894e5532b1a33a93d814272328"
 
 [[package]]
 name = "buckshot-roulette-gameplay-engine"
-version = "5.3.0"
+version = "5.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd9fd2521c8836cb37f3d6185522d3f848e40dcdbf16abba43a240b4644f315a"
+checksum = "02d6b4dd726c4c7ece8fd13c34836e91f2d20e37dd3ef184531f16e994c4fd8b"
 dependencies = [
  "anyhow",
  "indexmap",

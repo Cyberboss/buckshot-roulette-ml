@@ -1,23 +1,20 @@
-use std::{
-    cell::RefCell, collections::{HashMap, VecDeque}, fmt::format, os::linux::raw::stat
-};
+use std::{cell::RefCell, collections::VecDeque, ops::Index, rc::Rc};
 
 use buckshot_roulette_gameplay_engine::{
     game_session::{self, GameSession},
-    item::{
-        initialize_item_count_map, Item, NotAdreneline, UnaryItem, TOTAL_ITEMS, TOTAL_UNARY_ITEMS,
-    },
+    item::{initialize_item_count_map, Item, NotAdreneline, UnaryItem, TOTAL_ITEMS},
     loadout::MAX_SHELLS,
-    multiplayer_count::MultiplayerCount,
-    player_number::{self, PlayerNumber},
-    round::TurnSummary,
+    player_number::PlayerNumber,
+    round::{Round, TurnSummary},
     round_number::RoundNumber,
     round_player::StunState,
-    shell::ShellType,
+    seat::{self, Seat},
+    shell::{ShellType, ShotgunDamage},
+    turn::{ItemUseResult, LearnedShell, TakenAction, TerminalAction},
 };
 use rand::Rng;
 use rsrl::{
-    domains::{self, Action, Domain, Observation, Reward, State},
+    domains::{Action, Domain, Observation, Reward, State},
     spaces::{
         discrete::{Interval, Ordinal},
         ProductSpace,
@@ -25,7 +22,9 @@ use rsrl::{
 };
 
 use crate::{
-    game_action::{GameAction, TOTAL_ACTIONS},
+    game_action::{ActiveGameAction, AdrenelineItem, GameAction, TOTAL_ACTIONS},
+    game_controller::GameController,
+    relative_player::{OtherPlayer, RelativePlayer},
     seat_map::SeatMap,
 };
 
@@ -35,8 +34,12 @@ const REWARD_ROUND_LOSS: f64 = -1000.0;
 
 const REWARD_GAIN_HEALTH: f64 = 50.0;
 const REWARD_USELESS_SMOKE: f64 = 0.0;
+const REWARD_LOST_HEALTH: f64 = -25.0;
+
+const REWARD_ITEM_GENERIC: f64 = 0.0;
 
 const REWARD_SHOOT_SELF: f64 = -100.0;
+const REWARD_KILL_SELF: f64 = -500.0 + REWARD_ROUND_LOSS;
 const REWARD_SHOOT_SELF_BLANK: f64 = 50.0;
 const REWARD_SHOOT_SELF_SAWN: f64 = -200.0;
 
@@ -58,10 +61,11 @@ const STUN_STUNNED: i64 = 3;
 
 const MAX_HEALTH: i64 = 6;
 
-const TOTAL_SEATS: usize = 4;
-const OTHER_SEATS: usize = TOTAL_SEATS - 1;
+pub const TOTAL_SEATS: usize = 4;
+pub const OTHER_SEATS: usize = TOTAL_SEATS - 1;
 
-struct PlayerKnowledge {
+#[derive(Debug, Clone)]
+pub struct PlayerKnowledge {
     shells: VecDeque<i64>,
     remaining_live_rounds: i64,
     seat_map: SeatMap,
@@ -74,14 +78,30 @@ fn generate_master_item_list() -> Vec<Item> {
         .collect()
 }
 
-struct GameSessionDomain<'session, TRng, F> {
+#[derive(Debug, Clone)]
+struct PriorObservation {
+    observation: Observation<Vec<i64>>,
+    prior_health: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct GameSessionDomain<'session, TRng, F> {
+    prior_observation: Option<PriorObservation>,
+    controller: Rc<RefCell<GameController<TRng>>>,
     game_session: &'session RefCell<GameSession<TRng>>,
-    player_knowledge: PlayerKnowledge,
+    knowledge: Rc<RefCell<PlayerKnowledge>>,
     player_number: PlayerNumber,
     shell_inverted: bool,
     master_item_list: Vec<Item>,
     logger: F,
     logging_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum ShellUpdate {
+    Ejected(ShellType),
+    Learned(LearnedShell),
+    Inverted,
 }
 
 impl PlayerKnowledge {
@@ -92,9 +112,7 @@ impl PlayerKnowledge {
             seat_map,
         }
     }
-}
 
-impl PlayerKnowledge {
     fn initialize(&mut self, total_shells: usize, live_shells: usize) {
         self.shells.clear();
         for _ in 0..total_shells {
@@ -107,6 +125,30 @@ impl PlayerKnowledge {
         }
 
         self.remaining_live_rounds = live_shells.try_into().unwrap();
+    }
+
+    pub fn update(&mut self, shell: &ShellUpdate) {
+        match shell {
+            ShellUpdate::Ejected(shell_type) => {
+                self.shells.pop_front();
+                self.shells.push_back(SHELL_GONE);
+                if *shell_type == ShellType::Live {
+                    self.remaining_live_rounds -= 1;
+                }
+            }
+            ShellUpdate::Learned(learned_shell) => {
+                self.shells[learned_shell.relative_index] = match learned_shell.shell_type {
+                    ShellType::Live => SHELL_LIVE,
+                    ShellType::Blank => SHELL_BLANK,
+                }
+            }
+            ShellUpdate::Inverted => match self.shells[0] {
+                SHELL_BLANK => self.shells[0] = SHELL_LIVE,
+                SHELL_LIVE => self.shells[0] = SHELL_BLANK,
+                SHELL_UNKNOWN => {}
+                _ => unreachable!(),
+            },
+        }
     }
 }
 
@@ -121,6 +163,7 @@ where
     F: FnMut(ActionOrTurnSummary<TRng>),
 {
     pub fn new(
+        controller: Rc<RefCell<GameController<TRng>>>,
         game_session: &'session RefCell<GameSession<TRng>>,
         player_number: PlayerNumber,
         logger: F,
@@ -128,16 +171,21 @@ where
     ) -> Self {
         let session = game_session.borrow();
         let seats = session.round().unwrap().seats();
-        let player_knowledge = PlayerKnowledge::new(SeatMap::new(player_number, seats));
+        let seat_map = SeatMap::new(player_number, seats);
+        let knowledge = controller
+            .borrow_mut()
+            .register_knowledge(player_number, PlayerKnowledge::new(seat_map));
 
         let mut domain = GameSessionDomain {
             game_session,
-            player_knowledge,
+            controller,
+            knowledge,
             player_number,
             shell_inverted: false,
             master_item_list: generate_master_item_list(),
             logger,
             logging_enabled,
+            prior_observation: None,
         };
 
         domain.initialize_knowledge();
@@ -154,15 +202,88 @@ where
             .filter(|shell| shell.shell_type() == ShellType::Live)
             .count();
 
-        self.player_knowledge
+        self.knowledge
+            .borrow_mut()
             .initialize(shell_count, live_shell_count);
     }
-}
 
+    fn log_action<FLog>(&mut self, mut message_factory: FLog)
+    where
+        FLog: FnMut() -> String,
+    {
+        if self.logging_enabled {
+            let logger = &mut self.logger;
+            logger(ActionOrTurnSummary::Action(message_factory()));
+        }
+    }
+
+    fn log_summary(&mut self, summary: &TurnSummary<TRng>) {
+        if self.logging_enabled {
+            let logger = &mut self.logger;
+            logger(ActionOrTurnSummary::TurnSummary(summary));
+        }
+    }
+
+    pub fn pre_action_observe(&mut self) -> bool {
+        assert!(self.prior_observation.is_none());
+
+        let session = self.game_session.borrow();
+        match session.round() {
+            Some(round) => {
+                let prior_health = get_player_health(round, self.player_number);
+                self.prior_observation = Some(PriorObservation {
+                    observation: self.emit(),
+                    prior_health,
+                });
+                return round.next_player() == self.player_number;
+            }
+            None => panic!("Should not be observing a completed game!"),
+        }
+    }
+
+    fn bad_active_game_action(&mut self) -> f64 {
+        self.log_action(|| "Invalid action attempt!".to_string());
+        let own_player = self.player_number;
+        let mut session = self.game_session.borrow_mut();
+        let ejected_shell = session
+            .with_turn(
+                |turn| turn.shoot(own_player),
+                |summary| {
+                    self.log_summary(summary);
+                    match summary.shot_result.as_ref().unwrap().damage {
+                        ShotgunDamage::Blank => ShellUpdate::Ejected(ShellType::Blank),
+                        ShotgunDamage::RegularShot(_) | ShotgunDamage::SawedShot(_) => {
+                            ShellUpdate::Ejected(ShellType::Live)
+                        }
+                    }
+                },
+            )
+            .unwrap()
+            .unwrap();
+        self.controller.borrow_mut().update_knowledge(ejected_shell);
+
+        REWARD_INVALID_ACTION
+    }
+
+    fn item_action_available_check(&mut self, item: Item) -> Option<f64> {
+        let session = self.game_session.borrow();
+        let round = session.round().unwrap();
+
+        let seat = get_player_seat(round, self.player_number).unwrap();
+        let valid_use = seat_has_item(seat, item);
+        if valid_use {
+            self.log_action(|| format!("Uses item: {}", item));
+            None
+        } else {
+            Some(self.bad_active_game_action())
+        }
+    }
+}
 /// Seats are always coded (self?)left/opposite/right
 impl<'session, TRng, F> Domain for GameSessionDomain<'session, TRng, F>
 where
     TRng: Rng,
+    F: FnMut(ActionOrTurnSummary<TRng>),
 {
     type StateSpace = ProductSpace<Interval>;
     type ActionSpace = Ordinal;
@@ -241,7 +362,7 @@ where
 
                 state.push(turn_distance(current_player, self.player_number));
 
-                let knowledge = &self.player_knowledge;
+                let knowledge = self.knowledge.borrow();
                 state.push(knowledge.remaining_live_rounds);
                 state.push(if self.shell_inverted { 1 } else { 0 });
                 let modifiers = round.game_modifiers();
@@ -335,23 +456,316 @@ where
         let own_player = self.player_number;
 
         // first validate the action
-        let action = GameAction::parse(a);
+        let action = GameAction::parse(*a);
 
+        let prior_observation = self.prior_observation.take().unwrap();
+
+        let seat_map = self.knowledge.borrow().seat_map.clone();
         let reward = match action {
-            GameAction::Observe => if current_player == self.player_number {
-                self.log(|| format!("Player {} invalidly tries to observe!", player_number));
-                REWARD_INVALID_ACTION
-            }else {},
-            GameAction::Shoot(_) => todo!(),
-            GameAction::UnaryItem(_) => todo!(),
-            GameAction::Jammer(_) => todo!(),
-            GameAction::Adreneline(adreneline_target) => todo!(),
-        }
+            GameAction::Observe => {
+                if current_player == own_player {
+                    self.log_action(|| "Invalid observation attempt!".to_string());
+                    REWARD_INVALID_ACTION
+                } else {
+                    let current_player_health = get_player_health(round, own_player);
+                    let delta = prior_observation.prior_health - current_player_health;
+                    assert!(current_player_health <= prior_observation.prior_health);
+                    REWARD_LOST_HEALTH * f64::from(delta)
+                }
+            }
+            GameAction::Act(active_game_action) => {
+                if current_player != own_player {
+                    self.log_action(|| "Invalid action attempt!".to_string());
+                    REWARD_INVALID_ACTION
+                } else {
+                    match active_game_action {
+                        ActiveGameAction::Shoot(target_player) => match target_player {
+                            RelativePlayer::Own => {
+                                self.log_action(|| "Shoots self".to_string());
+                                let (ejected_shell, reward) = session
+                                    .with_turn(
+                                        |turn| turn.shoot(own_player),
+                                        |summary| {
+                                            self.log_summary(summary);
+                                            let shot_result = summary.shot_result.as_ref().unwrap();
+                                            match shot_result.damage {
+                                                ShotgunDamage::Blank => (
+                                                    ShellUpdate::Ejected(ShellType::Blank),
+                                                    REWARD_SHOOT_SELF_BLANK,
+                                                ),
+                                                ShotgunDamage::RegularShot(killed) => (
+                                                    ShellUpdate::Ejected(ShellType::Live),
+                                                    if killed {
+                                                        REWARD_KILL_SELF
+                                                    } else {
+                                                        REWARD_SHOOT_SELF
+                                                    },
+                                                ),
+                                                ShotgunDamage::SawedShot(killed) => (
+                                                    ShellUpdate::Ejected(ShellType::Live),
+                                                    if killed {
+                                                        REWARD_KILL_SELF
+                                                    } else {
+                                                        REWARD_SHOOT_SELF_SAWN
+                                                    },
+                                                ),
+                                            }
+                                        },
+                                    )
+                                    .unwrap()
+                                    .unwrap();
 
-        session
-            .with_turn(|turn| turn.shoot(current_player), |summary| {})
-            .unwrap();
-        todo!()
+                                self.controller.borrow_mut().update_knowledge(ejected_shell);
+                                reward
+                            }
+                            RelativePlayer::Other(other_player) => {
+                                match get_other_player(round, &seat_map, other_player) {
+                                    Some(target_seat) => match target_seat.player() {
+                                        Some(target_player) => {
+                                            let target_player_number =
+                                                target_player.player_number();
+                                            self.log_action(|| {
+                                                format!("Shoots {}", target_player_number)
+                                            });
+                                            let (ejected_shell, reward) = session
+                                                .with_turn(
+                                                    |turn| turn.shoot(own_player),
+                                                    |summary| {
+                                                        self.log_summary(summary);
+                                                        let shot_result =
+                                                            summary.shot_result.as_ref().unwrap();
+                                                        match shot_result.damage {
+                                                            ShotgunDamage::Blank => (
+                                                                ShellUpdate::Ejected(
+                                                                    ShellType::Blank,
+                                                                ),
+                                                                REWARD_SHOOT_OTHER_BLANK,
+                                                            ),
+                                                            ShotgunDamage::RegularShot(_)
+                                                            | ShotgunDamage::SawedShot(_) => (
+                                                                ShellUpdate::Ejected(
+                                                                    ShellType::Live,
+                                                                ),
+                                                                REWARD_SHOOT_OTHER,
+                                                            ),
+                                                        }
+                                                    },
+                                                )
+                                                .unwrap()
+                                                .unwrap();
+
+                                            self.controller
+                                                .borrow_mut()
+                                                .update_knowledge(ejected_shell);
+                                            reward
+                                        }
+                                        None => self.bad_active_game_action(),
+                                    },
+                                    None => self.bad_active_game_action(),
+                                }
+                            }
+                        },
+                        ActiveGameAction::UnaryItem(unary_item) => {
+                            let reward = self.item_action_available_check(Item::NotAdreneline(
+                                NotAdreneline::UnaryItem(unary_item),
+                            ));
+                            match reward {
+                                Some(reward) => reward,
+                                None => {
+                                    if unary_item == UnaryItem::Handsaw
+                                        && round.game_modifiers().shotgun_sawn
+                                    {
+                                        self.bad_active_game_action()
+                                    } else {
+                                        let mut ejected_or_learned_shell = None;
+                                        session
+                                        .with_turn(
+                                            |turn| {
+                                                let taken_action = turn.use_unary_item(unary_item);
+                                                ejected_or_learned_shell = match &taken_action {
+                                                    TakenAction::Continued(continued_turn) => {
+                                                        match continued_turn.item_result().as_ref().unwrap() {
+                                                            ItemUseResult::Default => None,
+                                                            ItemUseResult::ShotgunRacked(shotgun_rack_result) => Some(ShellUpdate::Ejected(shotgun_rack_result.ejected_shell_type)),
+                                                            ItemUseResult::LearnedShell(learned_shell) => Some(ShellUpdate::Learned(learned_shell.clone())),
+                                                            ItemUseResult::StunnedPlayer(_) => unreachable!(),
+                                                        }
+                                                    }
+                                                    TakenAction::Terminal(taken_turn) => {
+                                                        match &taken_turn.action {
+                                                            TerminalAction::Item(
+                                                                item_use_result,
+                                                            ) => match item_use_result {
+                                                                ItemUseResult::ShotgunRacked(shotgun_rack_result) => Some(ShellUpdate::Ejected(shotgun_rack_result.ejected_shell_type)),
+                                                                ItemUseResult::Default | ItemUseResult::LearnedShell(_) | ItemUseResult::StunnedPlayer(_) => unreachable!(),
+                                                            },
+                                                            TerminalAction::Shot(_) => unreachable!()
+                                                        }
+                                                    }
+                                                };
+
+                                                taken_action
+                                            },
+                                            |summary| self.log_summary(summary),
+                                        )
+                                        .unwrap();
+
+                                        if unary_item == UnaryItem::Cigarettes {
+                                            let current_player_health = get_player_health(
+                                                session.round().unwrap(),
+                                                own_player,
+                                            );
+                                            if prior_observation.prior_health
+                                                == current_player_health
+                                            {
+                                                REWARD_USELESS_SMOKE
+                                            } else {
+                                                REWARD_GAIN_HEALTH
+                                            }
+                                        } else {
+                                            if unary_item == UnaryItem::Inverter {
+                                                self.controller
+                                                    .borrow_mut()
+                                                    .update_knowledge(ShellUpdate::Inverted);
+                                            }
+
+                                            REWARD_ITEM_GENERIC
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        ActiveGameAction::Jammer(other_player) => {
+                            let reward = self.item_action_available_check(Item::NotAdreneline(
+                                NotAdreneline::Jammer,
+                            ));
+                            match reward {
+                                Some(reward) => reward,
+                                None => match get_other_player(round, &seat_map, other_player) {
+                                    Some(target_seat) => match target_seat.player() {
+                                        Some(target_player) => match target_player.stun_state() {
+                                            StunState::Unstunned => {
+                                                let target_player_number =
+                                                    target_player.player_number();
+
+                                                self.log_action(|| {
+                                                    format!(
+                                                        "Targeting {} with Jammer",
+                                                        target_player_number
+                                                    )
+                                                });
+                                                session
+                                                    .with_turn(
+                                                        |turn| {
+                                                            turn.use_jammer(target_player_number)
+                                                        },
+                                                        |_| unreachable!(),
+                                                    )
+                                                    .unwrap();
+                                                REWARD_ITEM_GENERIC
+                                            }
+                                            StunState::Stunned | StunState::Recovering => {
+                                                self.bad_active_game_action()
+                                            }
+                                        },
+                                        None => self.bad_active_game_action(),
+                                    },
+                                    None => self.bad_active_game_action(),
+                                },
+                            }
+                        }
+                        ActiveGameAction::Adreneline(adreneline_target) => {
+                            let reward = self.item_action_available_check(Item::Adreneline);
+                            match reward {
+                                Some(reward) => reward,
+                                None => {
+                                    match get_other_player(
+                                        round,
+                                        &seat_map,
+                                        adreneline_target.target_player,
+                                    ) {
+                                        Some(seat) => {
+                                            let target_item = match adreneline_target.item {
+                                                AdrenelineItem::Unary(unary_item) => {
+                                                    NotAdreneline::UnaryItem(unary_item)
+                                                }
+                                                AdrenelineItem::Jammer(_) => NotAdreneline::Jammer,
+                                            };
+
+                                            if seat_has_item(seat, Item::NotAdreneline(target_item))
+                                            {
+                                                let theive_from = seat.player_number();
+                                                match adreneline_target.item {
+                                                    AdrenelineItem::Unary(unary_item) => {
+                                                        if unary_item == UnaryItem::Handsaw
+                                                            && round.game_modifiers().shotgun_sawn
+                                                        {
+                                                            self.bad_active_game_action()
+                                                        } else {
+                                                            self.log_action(|| format!("Using {} stolen from player {}", Item::NotAdreneline(NotAdreneline::UnaryItem(unary_item)), theive_from));
+                                                            session
+                                                                .with_turn(
+                                                                    |turn| {
+                                                                        turn.use_adreneline(
+                                                                            theive_from,
+                                                                            unary_item,
+                                                                        )
+                                                                    },
+                                                                    |_| unreachable!(),
+                                                                )
+                                                                .unwrap();
+                                                            REWARD_ITEM_GENERIC
+                                                        }
+                                                    }
+                                                    AdrenelineItem::Jammer(other_player) => {
+                                                        match get_other_player(
+                                                            round,
+                                                            &seat_map,
+                                                            other_player,
+                                                        ) {
+                                                            Some(target_seat) => {
+                                                                match target_seat.player() {
+                                                                    Some(target_player) =>  match target_player.stun_state() {
+                                                                        StunState::Unstunned => {
+                                                                            let target_player_number =
+                                                                                target_player.player_number();
+                                                                            self.log_action(|| format!("Targeting {} with jammer stolen from player {}", target_player_number, theive_from));
+                                                                            session
+                                                                                .with_turn(
+                                                                                    |turn| {
+                                                                                        turn.use_adreneline_then_jammer(theive_from, target_player_number)
+                                                                                    },
+                                                                                    |_| unreachable!(),
+                                                                                )
+                                                                                .unwrap();
+                                                                            REWARD_ITEM_GENERIC
+                                                                        }
+                                                                        StunState::Stunned | StunState::Recovering => {
+                                                                            self.bad_active_game_action()
+                                                                        }
+                                                                    },
+                                                                    None => self
+                                                                        .bad_active_game_action(),
+                                                                }
+                                                            }
+                                                            None => self.bad_active_game_action(),
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                self.bad_active_game_action()
+                                            }
+                                        }
+                                        None => self.bad_active_game_action(),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        (self.emit(), reward)
     }
 }
 
@@ -402,4 +816,63 @@ fn player_as_index(player: PlayerNumber) -> i64 {
         PlayerNumber::Three => 2,
         PlayerNumber::Four => 3,
     }
+}
+
+fn get_other_player<'round, TRng>(
+    round: &'round Round<TRng>,
+    seat_map: &SeatMap,
+    other_player: OtherPlayer,
+) -> Option<&'round Seat>
+where
+    TRng: Rng,
+{
+    let seats = round.seats();
+
+    let index = match other_player {
+        OtherPlayer::Left => seat_map.left_seat_index,
+        OtherPlayer::Opposite => Some(seat_map.opposite_seat_index),
+        OtherPlayer::Right => seat_map.right_seat_index,
+    };
+
+    index.map(|index| seats.index(index))
+}
+
+fn get_player_seat<TRng>(round: &Round<TRng>, player_number: PlayerNumber) -> Option<&Seat>
+where
+    TRng: Rng,
+{
+    round
+        .seats()
+        .iter()
+        .filter(|seat| seat.player_number() == player_number)
+        .next()
+}
+
+fn get_player_health<TRng>(round: &Round<TRng>, player_number: PlayerNumber) -> i32
+where
+    TRng: Rng,
+{
+    round
+        .seats()
+        .iter()
+        .filter_map(|seat| match seat.player() {
+            Some(player) => Some(if player_number == player.player_number() {
+                player.health()
+            } else {
+                0
+            }),
+            None => {
+                if player_number == seat.player_number() {
+                    Some(0)
+                } else {
+                    None
+                }
+            }
+        })
+        .next()
+        .unwrap()
+}
+
+fn seat_has_item(seat: &Seat, item: Item) -> bool {
+    seat.items().iter().any(|seat_item| *seat_item == item)
 }

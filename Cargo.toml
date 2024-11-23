@@ -10,8 +10,8 @@ readme = "README.md"
 
 
 [dependencies]
-buckshot-roulette-gameplay-engine = "5.3.0"
+buckshot-roulette-gameplay-engine = "5.4.0"
 blas-src = { version = "0.4", features = ["openblas"] }
-openblas-src = "0.7"
+openblas-src = { version = "0.7", features = ["static"] }
 rsrl = { version = "0.8.1", features = ["blas"] }
 rand = "0.7"

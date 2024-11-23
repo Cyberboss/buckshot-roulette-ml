@@ -1,7 +1,9 @@
 extern crate blas_src;
 
 mod game_action;
+mod game_controller;
 mod game_session_domain;
+mod relative_player;
 mod seat_map;
 
 use rand::{rngs::StdRng, SeedableRng};

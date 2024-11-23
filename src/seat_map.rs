@@ -1,5 +1,6 @@
 use buckshot_roulette_gameplay_engine::{player_number::PlayerNumber, seat::Seat};
 
+#[derive(Debug, Clone)]
 pub struct SeatMap {
     pub own_player: PlayerNumber,
     pub left_player: PlayerNumber,
