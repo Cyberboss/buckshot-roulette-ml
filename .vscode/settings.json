@@ -1,0 +1,9 @@
+{
+    "rust-analyzer.cargo.extraEnv": {
+        "OPENBLAS_TARGET": "HASWELL"
+    },
+    "[rust]": {
+        "editor.defaultFormatter": "rust-lang.rust-analyzer",
+        "editor.formatOnSave": true
+    }
+}
