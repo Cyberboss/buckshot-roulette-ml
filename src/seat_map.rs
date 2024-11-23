@@ -1,7 +1,4 @@
-use buckshot_roulette_gameplay_engine::{
-    player_number::{self, PlayerNumber},
-    seat::Seat,
-};
+use buckshot_roulette_gameplay_engine::{player_number::PlayerNumber, seat::Seat};
 
 pub struct SeatMap {
     pub own_player: PlayerNumber,
@@ -44,22 +41,25 @@ fn right_player(player_number: PlayerNumber) -> PlayerNumber {
 
 impl SeatMap {
     pub fn new(own_player: PlayerNumber, seats: &Vec<Seat>) -> Self {
-        let own_player = round.next_player();
         let left_player = left_player(own_player);
         let right_player = right_player(own_player);
         let opposite_player = opposite_player(own_player);
 
-        let own_seat_index = None;
-        let left_seat_index = None;
-        let opposite_seat_index = None;
-        let right_seat_index = None;
+        let mut own_seat_index = None;
+        let mut left_seat_index = None;
+        let mut opposite_seat_index = None;
+        let mut right_seat_index = None;
 
         for i in 0..seats.len() {
-            match seats[i].player_number() {
-                own_player => own_seat_index = Some(i),
-                left_player => left_seat_index = Some(i),
-                right_player => right_seat_index = Some(i),
-                opposite_player => opposite_seat_index = Some(i),
+            let seat_player = seats[i].player_number();
+            if seat_player == own_player {
+                own_seat_index = Some(i);
+            } else if seat_player == left_player {
+                left_seat_index = Some(i);
+            } else if seat_player == right_player {
+                right_seat_index = Some(i);
+            } else if seat_player == opposite_player {
+                opposite_seat_index = Some(i);
             }
         }
         SeatMap {

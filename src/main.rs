@@ -1,5 +1,6 @@
 extern crate blas_src;
 
+mod game_action;
 mod game_session_domain;
 mod seat_map;
 

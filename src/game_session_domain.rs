@@ -1,28 +1,48 @@
-use std::collections::{HashMap, VecDeque};
+use std::{
+    cell::RefCell, collections::{HashMap, VecDeque}, fmt::format, os::linux::raw::stat
+};
 
 use buckshot_roulette_gameplay_engine::{
-    game_session::GameSession,
+    game_session::{self, GameSession},
     item::{
         initialize_item_count_map, Item, NotAdreneline, UnaryItem, TOTAL_ITEMS, TOTAL_UNARY_ITEMS,
     },
     loadout::MAX_SHELLS,
     multiplayer_count::MultiplayerCount,
-    player_number::PlayerNumber,
+    player_number::{self, PlayerNumber},
+    round::TurnSummary,
     round_number::RoundNumber,
     round_player::StunState,
     shell::ShellType,
 };
+use rand::Rng;
 use rsrl::{
-    domains::{Action, Domain, Observation, Reward, State},
+    domains::{self, Action, Domain, Observation, Reward, State},
     spaces::{
         discrete::{Interval, Ordinal},
         ProductSpace,
     },
 };
 
-const ACTION_SHOOT_SELF: u32 = 0;
-const ACTION_SHOOT_LEFT: u32 = 1;
-const ACTION_SHOOT_ACROSS: u32 = 2;
+use crate::{
+    game_action::{GameAction, TOTAL_ACTIONS},
+    seat_map::SeatMap,
+};
+
+const REWARD_INVALID_ACTION: f64 = -1000000.0;
+const REWARD_ROUND_WIN: f64 = 4000.0;
+const REWARD_ROUND_LOSS: f64 = -1000.0;
+
+const REWARD_GAIN_HEALTH: f64 = 50.0;
+const REWARD_USELESS_SMOKE: f64 = 0.0;
+
+const REWARD_SHOOT_SELF: f64 = -100.0;
+const REWARD_SHOOT_SELF_BLANK: f64 = 50.0;
+const REWARD_SHOOT_SELF_SAWN: f64 = -200.0;
+
+const REWARD_SHOOT_OTHER: f64 = 100.0;
+const REWARD_SHOOT_OTHER_BLANK: f64 = -10.0;
+const REWARD_SHOOT_OTHER_SAWN: f64 = 200.0;
 
 const NUM_ITEM_SLOTS: i64 = 8;
 
@@ -41,10 +61,6 @@ const MAX_HEALTH: i64 = 6;
 const TOTAL_SEATS: usize = 4;
 const OTHER_SEATS: usize = TOTAL_SEATS - 1;
 
-use rand::Rng;
-
-use crate::seat_map::SeatMap;
-
 struct PlayerKnowledge {
     shells: VecDeque<i64>,
     remaining_live_rounds: i64,
@@ -58,11 +74,14 @@ fn generate_master_item_list() -> Vec<Item> {
         .collect()
 }
 
-struct GameSessionDomain<TRng> {
-    game_session: GameSession<TRng>,
-    player_knowledge: HashMap<PlayerNumber, PlayerKnowledge>,
+struct GameSessionDomain<'session, TRng, F> {
+    game_session: &'session RefCell<GameSession<TRng>>,
+    player_knowledge: PlayerKnowledge,
+    player_number: PlayerNumber,
     shell_inverted: bool,
     master_item_list: Vec<Item>,
+    logger: F,
+    logging_enabled: bool,
 }
 
 impl PlayerKnowledge {
@@ -91,47 +110,34 @@ impl PlayerKnowledge {
     }
 }
 
-impl<TRng> GameSessionDomain<TRng>
+pub enum ActionOrTurnSummary<'turn, TRng> {
+    Action(String),
+    TurnSummary(&'turn TurnSummary<TRng>),
+}
+
+impl<'session, TRng, F> GameSessionDomain<'session, TRng, F>
 where
     TRng: Rng,
+    F: FnMut(ActionOrTurnSummary<TRng>),
 {
-    pub fn new(multiplayer_count: MultiplayerCount, rng: TRng) -> Self {
-        let mut player_knowledge = HashMap::with_capacity(TOTAL_SEATS);
-
-        let game_session = GameSession::new(multiplayer_count, rng);
-        let seats = game_session.round().unwrap().seats();
-
-        player_knowledge.insert(
-            PlayerNumber::One,
-            PlayerKnowledge::new(SeatMap::new(PlayerNumber::One, seats)),
-        );
-        player_knowledge.insert(
-            PlayerNumber::Two,
-            PlayerKnowledge::new(SeatMap::new(PlayerNumber::One, seats)),
-        );
-
-        match multiplayer_count {
-            MultiplayerCount::Two => {}
-            MultiplayerCount::Three | MultiplayerCount::Four => {
-                player_knowledge.insert(
-                    PlayerNumber::Three,
-                    PlayerKnowledge::new(SeatMap::new(PlayerNumber::One, seats)),
-                );
-
-                if multiplayer_count == MultiplayerCount::Four {
-                    player_knowledge.insert(
-                        PlayerNumber::One,
-                        PlayerKnowledge::new(SeatMap::new(PlayerNumber::One, seats)),
-                    );
-                }
-            }
-        }
+    pub fn new(
+        game_session: &'session RefCell<GameSession<TRng>>,
+        player_number: PlayerNumber,
+        logger: F,
+        logging_enabled: bool,
+    ) -> Self {
+        let session = game_session.borrow();
+        let seats = session.round().unwrap().seats();
+        let player_knowledge = PlayerKnowledge::new(SeatMap::new(player_number, seats));
 
         let mut domain = GameSessionDomain {
             game_session,
             player_knowledge,
+            player_number,
             shell_inverted: false,
             master_item_list: generate_master_item_list(),
+            logger,
+            logging_enabled,
         };
 
         domain.initialize_knowledge();
@@ -140,7 +146,8 @@ where
     }
 
     fn initialize_knowledge(&mut self) {
-        let shells = self.game_session.round().unwrap().shells();
+        let session = self.game_session.borrow();
+        let shells = session.round().unwrap().shells();
         let shell_count = shells.len();
         let live_shell_count = shells
             .iter()
@@ -148,13 +155,12 @@ where
             .count();
 
         self.player_knowledge
-            .iter_mut()
-            .for_each(|(_, knowledge)| knowledge.initialize(shell_count, live_shell_count));
+            .initialize(shell_count, live_shell_count);
     }
 }
 
 /// Seats are always coded (self?)left/opposite/right
-impl<TRng> Domain for GameSessionDomain<TRng>
+impl<'session, TRng, F> Domain for GameSessionDomain<'session, TRng, F>
 where
     TRng: Rng,
 {
@@ -163,6 +169,12 @@ where
 
     fn state_space(&self) -> Self::StateSpace {
         let mut space = ProductSpace::empty();
+
+        // round number or 0 for complete
+        space = space + Interval::bounded(0, 3);
+
+        // turn calculator with 0 being current player
+        space = space + Interval::bounded(0, 4);
 
         // knowledge of number of remaining live shells
         space = space + Interval::bounded(0, 9);
@@ -194,7 +206,7 @@ where
         }
 
         // stun state of other seats
-        for _ in 0..OTHER_SEATS {
+        for _ in 0..TOTAL_SEATS {
             space = space + Interval::bounded(0, 3);
         }
 
@@ -209,26 +221,27 @@ where
     }
 
     fn action_space(&self) -> Self::ActionSpace {
-        let unary_item_use_possibilities = TOTAL_UNARY_ITEMS;
-
-        let jammer_use_possibilities = OTHER_SEATS;
-
-        Ordinal::new(
-            1 // shoot self
-            + OTHER_SEATS // shoot other seats
-            + unary_item_use_possibilities // use unary items
-            + jammer_use_possibilities // use jammer
-            + OTHER_SEATS * (unary_item_use_possibilities + jammer_use_possibilities), // use adreneline
-        )
+        Ordinal::new(TOTAL_ACTIONS)
     }
 
     fn emit(&self) -> Observation<State<Self>> {
-        let expected_capacity = 5 + 10 + 4 + 3 + TOTAL_ITEMS;
-        match self.game_session.round() {
+        let expected_capacity = 6 + 10 + 4 + 4 + TOTAL_ITEMS;
+        let session = self.game_session.borrow();
+        match session.round() {
             Some(round) => {
                 let mut state: Vec<i64> = Vec::with_capacity(expected_capacity);
 
-                let knowledge = self.player_knowledge.get(&round.next_player()).unwrap();
+                state.push(match round.number() {
+                    RoundNumber::One => 1,
+                    RoundNumber::Two => 2,
+                    RoundNumber::Three => 3,
+                });
+
+                let current_player = round.next_player();
+
+                state.push(turn_distance(current_player, self.player_number));
+
+                let knowledge = &self.player_knowledge;
                 state.push(knowledge.remaining_live_rounds);
                 state.push(if self.shell_inverted { 1 } else { 0 });
                 let modifiers = round.game_modifiers();
@@ -236,12 +249,7 @@ where
                 state.push(if modifiers.shotgun_sawn { 1 } else { 0 });
                 state.push(match round.number() {
                     RoundNumber::One | RoundNumber::Two => match round.first_dead_player() {
-                        Some(player_number) => match player_number {
-                            PlayerNumber::One => 0,
-                            PlayerNumber::Two => 1,
-                            PlayerNumber::Three => 2,
-                            PlayerNumber::Four => 3,
-                        },
+                        Some(player_number) => player_as_index(player_number),
                         None => 4,
                     },
                     RoundNumber::Three => 5,
@@ -282,6 +290,7 @@ where
                     })
                 };
 
+                add_seat_stun(Some(seat_map.own_seat_index));
                 add_seat_stun(seat_map.left_seat_index);
                 add_seat_stun(Some(seat_map.opposite_seat_index));
                 add_seat_stun(seat_map.right_seat_index);
@@ -320,6 +329,28 @@ where
     }
 
     fn step(&mut self, a: &Action<Self>) -> (Observation<State<Self>>, Reward) {
+        let mut session = self.game_session.borrow_mut();
+        let round = session.round().unwrap();
+        let current_player = round.next_player();
+        let own_player = self.player_number;
+
+        // first validate the action
+        let action = GameAction::parse(a);
+
+        let reward = match action {
+            GameAction::Observe => if current_player == self.player_number {
+                self.log(|| format!("Player {} invalidly tries to observe!", player_number));
+                REWARD_INVALID_ACTION
+            }else {},
+            GameAction::Shoot(_) => todo!(),
+            GameAction::UnaryItem(_) => todo!(),
+            GameAction::Jammer(_) => todo!(),
+            GameAction::Adreneline(adreneline_target) => todo!(),
+        }
+
+        session
+            .with_turn(|turn| turn.shoot(current_player), |summary| {})
+            .unwrap();
         todo!()
     }
 }
@@ -339,5 +370,36 @@ fn get_item_index(item: &Item) -> usize {
             NotAdreneline::Jammer => 7,
         },
         Item::Adreneline => 8,
+    }
+}
+
+fn turn_distance(current: PlayerNumber, target: PlayerNumber) -> i64 {
+    let current_index = player_as_index(current);
+    let target_index = player_as_index(target);
+
+    let raw_distance = target_index - current_index;
+    if raw_distance >= 0 {
+        raw_distance
+    } else {
+        raw_distance + 4
+    }
+}
+
+#[test]
+fn test_turn_disance() {
+    assert_eq!(0, turn_distance(PlayerNumber::One, PlayerNumber::One));
+    assert_eq!(0, turn_distance(PlayerNumber::Three, PlayerNumber::Three));
+    assert_eq!(2, turn_distance(PlayerNumber::One, PlayerNumber::Three));
+    assert_eq!(3, turn_distance(PlayerNumber::One, PlayerNumber::Four));
+    assert_eq!(1, turn_distance(PlayerNumber::Four, PlayerNumber::One));
+    assert_eq!(3, turn_distance(PlayerNumber::Four, PlayerNumber::Three));
+}
+
+fn player_as_index(player: PlayerNumber) -> i64 {
+    match player {
+        PlayerNumber::One => 0,
+        PlayerNumber::Two => 1,
+        PlayerNumber::Three => 2,
+        PlayerNumber::Four => 3,
     }
 }
