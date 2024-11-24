@@ -3,13 +3,21 @@ extern crate blas_src;
 mod game_action;
 mod game_controller;
 mod game_session_domain;
+mod player_knowledge;
 mod relative_player;
 mod seat_map;
 
-use rand::{rngs::StdRng, SeedableRng};
+use std::cell::RefCell;
+
+use buckshot_roulette_gameplay_engine::{
+    game_session::GameSession, multiplayer_count::MultiplayerCount, player_number::PlayerNumber,
+};
+use game_controller::GameController;
+use game_session_domain::{action_space_static, state_space_static};
+use rand::{rngs::StdRng, RngCore, SeedableRng};
 use rsrl::{
     control::td::SARSALambda,
-    domains::{Domain, MountainCar},
+    domains::Domain,
     fa::linear::{
         basis::{Combinators, Fourier},
         optim::SGD,
@@ -28,13 +36,11 @@ const GAMMA: f64 = 0.99;
 const LAMBDA: f64 = 0.7;
 
 fn main() {
-    let env = MountainCar::default();
-
     let mut rng = StdRng::seed_from_u64(0);
     let mut agent = {
-        let n_actions = env.action_space().card().into();
+        let n_actions = action_space_static().card().into();
 
-        let basis = Fourier::from_space(5, env.state_space()).with_bias();
+        let basis = Fourier::from_space(5, state_space_static()).with_bias();
         let fa_theta = make_shared(LFA::vector(basis, SGD(1.0), n_actions));
 
         let policy = EpsilonGreedy::new(Greedy::new(fa_theta.clone()), Random::new(n_actions), 0.2);
@@ -54,29 +60,70 @@ fn main() {
     for e in 0..1000 {
         // Episode loop:
         let mut j = 0;
-        let mut env = MountainCar::default();
-        let mut action = agent.policy.sample(&mut rng, env.emit().state());
+        let session = RefCell::new(GameSession::new(
+            MultiplayerCount::Two,
+            StdRng::seed_from_u64(rng.next_u64()),
+        ));
+
+        let mut controller = GameController::new(
+            &session,
+            (agent, rng),
+            |(agent, mut rng), domain| {
+                (
+                    agent.policy.sample(&mut rng, domain.emit().state()),
+                    (agent, rng),
+                )
+            },
+            |(mut agent, rng), transition| {
+                agent.handle(transition).unwrap();
+                (agent, rng)
+            },
+            true,
+        );
+
+        controller.register_domain(PlayerNumber::One, false);
+        controller.register_domain(PlayerNumber::Two, false);
 
         for i in 0.. {
-            // Trajectory loop:
             j = i;
-
-            let t = env.transition(action);
-
-            agent.handle(&t).ok();
-            action = agent.policy.sample(&mut rng, t.to.state());
-
-            if t.terminated() {
+            if controller.take_domain_action() {
                 break;
             }
         }
 
+        (agent, rng) = controller.extract_agent();
         agent.policy.epsilon *= 0.995;
 
         println!("Batch {}: {} steps...", e + 1, j + 1);
     }
 
-    let traj = MountainCar::default().rollout(|s| agent.policy.mode(s), Some(1000));
+    let session = RefCell::new(GameSession::new(
+        MultiplayerCount::Two,
+        StdRng::seed_from_u64(rng.next_u64()),
+    ));
 
-    println!("OOS: {} states...", traj.n_states());
+    let mut controller = GameController::new(
+        &session,
+        (agent, rng),
+        |(agent, mut rng), domain| {
+            (
+                agent.policy.sample(&mut rng, domain.emit().state()),
+                (agent, rng),
+            )
+        },
+        |(mut agent, rng), transition| {
+            agent.handle(transition).unwrap();
+            (agent, rng)
+        },
+        true,
+    );
+
+    controller.register_domain(PlayerNumber::One, true);
+    controller.register_domain(PlayerNumber::Two, true);
+
+    loop {
+        if controller.take_domain_action() {
+            break;
+        }
+    }
 }

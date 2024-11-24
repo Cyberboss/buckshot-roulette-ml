@@ -96,6 +96,7 @@ dependencies = [
 name = "buckshot-roulette-ml"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "blas-src 0.4.0",
  "buckshot-roulette-gameplay-engine",
  "openblas-src",
