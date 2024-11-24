@@ -3,6 +3,7 @@ use std::{cell::RefCell, ops::Index};
 use buckshot_roulette_gameplay_engine::{
     game_session::GameSession,
     item::{initialize_item_count_map, Item, NotAdreneline, UnaryItem, TOTAL_ITEMS},
+    loadout::MAX_SHELLS,
     player_number::PlayerNumber,
     round::{Round, RoundContinuation, TurnContinuation, TurnSummary},
     round_number::RoundNumber,
@@ -13,6 +14,7 @@ use buckshot_roulette_gameplay_engine::{
 };
 use rand::Rng;
 use rsrl::{
+    control::ac,
     domains::{Action, Domain, Observation, Reward, State},
     spaces::{discrete::Ordinal, real::Interval, ProductSpace},
 };
@@ -191,6 +193,15 @@ where
         self.set_action_update(|update| update.global_shell_update = Some(ejected_shell));
 
         REWARD_INVALID_ACTION
+    }
+
+    pub fn reset_knowledge(&mut self) {
+        let session = self.game_session.borrow();
+        let loadout = session.round().unwrap().loadout();
+        self.knowledge.initialize(
+            loadout.initial_blank_rounds + loadout.initial_live_rounds,
+            loadout.initial_live_rounds,
+        );
     }
 
     fn item_action_available_check(&mut self, item: Item) -> Option<f64> {
@@ -693,7 +704,7 @@ pub fn state_space_static() -> ProductSpace<Interval> {
     space = space + Interval::bounded(0.0, 6.0);
 
     // knowledge of all ten shells positions starting with what's chambered
-    for _ in 0..10 {
+    for _ in 0..MAX_SHELLS {
         // all 4 states
         space = space + Interval::bounded(0.0, 3.0); // total shells remaining
     }
@@ -835,7 +846,39 @@ fn seat_has_item(seat: &Seat, item: Item) -> bool {
 
 fn basic_log<'turn, TRng>(action_or_summary: ActionOrTurnSummary<'turn, TRng>) {
     match action_or_summary {
-        ActionOrTurnSummary::Action(_) => todo!(),
-        ActionOrTurnSummary::TurnSummary(_) => todo!(),
+        ActionOrTurnSummary::Action(action) => println!("{}", action),
+        ActionOrTurnSummary::TurnSummary(summary) => {
+            if let Some(shot_result) = &summary.shot_result {
+                let killed;
+                let damage = match shot_result.damage {
+                    ShotgunDamage::Blank => {
+                        killed = false;
+                        "0"
+                    }
+                    ShotgunDamage::RegularShot(inner_killed) => {
+                        killed = inner_killed;
+                        "1"
+                    }
+                    ShotgunDamage::SawedShot(inner_killed) => {
+                        killed = inner_killed;
+                        "2"
+                    }
+                };
+
+                println!(
+                    "Player {} was shot taking {} damage. They were{} killed",
+                    shot_result.target_player,
+                    damage,
+                    if killed { "" } else { " NOT" }
+                );
+            }
+
+            match &summary.round_continuation {
+                RoundContinuation::RoundContinues(_) => {}
+                RoundContinuation::RoundEnds(finished_round) => {
+                    println!("Player {} wins the round!", finished_round.winner())
+                }
+            }
+        }
     }
 }

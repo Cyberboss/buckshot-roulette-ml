@@ -38,7 +38,7 @@ where
         enable_updates: bool,
         enable_logging: bool,
     ) -> Self {
-        let controller = GameController {
+        let mut controller = GameController {
             session,
             domains: HashMap::with_capacity(4),
             agent: Some(agent),
@@ -130,7 +130,11 @@ where
         new_round && self.session.borrow().round().is_none()
     }
 
-    fn log_loadout(&self, new_round: bool) {
+    fn log_loadout(&mut self, new_round: bool) {
+        self.domains
+            .iter_mut()
+            .for_each(|(_, domain)| domain.reset_knowledge());
+
         if !self.enable_logging {
             return;
         }

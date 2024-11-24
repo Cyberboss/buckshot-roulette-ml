@@ -40,6 +40,9 @@ fn main() {
     let mut agent = {
         let n_actions = action_space_static().card().into();
 
+        let test_card = state_space_static().card();
+        let test_dim = state_space_static().dim();
+
         let basis = Fourier::from_space(5, state_space_static()).with_bias();
         let fa_theta = make_shared(LFA::vector(basis, SGD(1.0), n_actions));
 
@@ -79,6 +82,7 @@ fn main() {
                 (agent, rng)
             },
             true,
+            false,
         );
 
         controller.register_domain(PlayerNumber::One, false);
@@ -115,6 +119,7 @@ fn main() {
             agent.handle(transition).unwrap();
             (agent, rng)
         },
+        true,
         true,
     );
 

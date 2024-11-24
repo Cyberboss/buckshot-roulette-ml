@@ -39,7 +39,7 @@ impl PlayerKnowledge {
         }
     }
 
-    fn initialize(&mut self, total_shells: usize, live_shells: usize) {
+    pub fn initialize(&mut self, total_shells: usize, live_shells: usize) {
         self.shells.clear();
         for _ in 0..total_shells {
             self.shells.push_back(SHELL_UNKNOWN);
