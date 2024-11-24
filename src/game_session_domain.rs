@@ -41,6 +41,7 @@ const REWARD_USELESS_SMOKE: f64 = 0.0;
 const REWARD_LOST_HEALTH: f64 = -25.0;
 
 const REWARD_ITEM_GENERIC: f64 = 0.0;
+const REWARD_RACKED_EMPTY: f64 = -250.0;
 
 const REWARD_SHOOT_SELF: f64 = -100.0;
 const REWARD_KILL_SELF: f64 = -500.0 + REWARD_ROUND_LOSS;
@@ -423,13 +424,7 @@ where
     fn step(&mut self, a: &Action<Self>) -> (Observation<State<Self>>, Reward) {
         assert!(self.action_update.is_none());
         let mut session = self.game_session.borrow_mut();
-        let round = match session.round() {
-            Some(round) => round,
-            None => {
-                drop(session);
-                return (self.emit(), REWARD_ROUND_LOSS);
-            }
-        };
+        let round = session.round().unwrap();
         let current_player = round.next_player();
         let own_player = self.player_number;
 
@@ -738,10 +733,10 @@ where
                                                                             unary_item,
                                                                         )
                                                                     },
-                                                                    |_| unreachable!(),
+                                                                    |summary| REWARD_RACKED_EMPTY,
                                                                 )
-                                                                .unwrap();
-                                                            REWARD_ITEM_GENERIC
+                                                                .unwrap()
+                                                                .unwrap_or(REWARD_ITEM_GENERIC)
                                                         }
                                                     }
                                                     AdrenelineItem::Jammer(other_player) => {

@@ -53,7 +53,7 @@ fn main() {
     let mut agent = {
         let n_actions = action_space_static().card().into();
 
-        let memory_size = 1024 * 1024;
+        let memory_size = 1024;
 
         let s = DeterministicHasher {};
         let basis = TileCoding::new(s, 1000, memory_size).with_bias();

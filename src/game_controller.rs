@@ -90,29 +90,31 @@ where
 
         let action_update = acting_domain.action_update();
 
-        if self.enable_logging {
-            println!("Processing observations");
-        }
+        if self.session.borrow().round().is_some() {
+            if self.enable_logging {
+                println!("Processing observations");
+            }
 
-        // update observing domains
-        domains
-            .iter_mut()
-            .filter(|(player_number, _)| **player_number != acting_player)
-            .for_each(|(_, domain)| {
-                let (sample, mut agent) = (self.sample)(self.agent.take().unwrap(), &domain);
-                let transition = domain.transition(sample);
-                domain.action_update();
-                if self.enable_updates {
-                    agent = (self.handle)(agent, &transition);
-                }
-                self.agent = Some(agent);
-
-                if let Some(action_update) = &action_update {
-                    if let Some(shell_update) = &action_update.global_shell_update {
-                        domain.update_global_knowledge(shell_update);
+            // update observing domains
+            domains
+                .iter_mut()
+                .filter(|(player_number, _)| **player_number != acting_player)
+                .for_each(|(_, domain)| {
+                    let (sample, mut agent) = (self.sample)(self.agent.take().unwrap(), &domain);
+                    let transition = domain.transition(sample);
+                    domain.action_update();
+                    if self.enable_updates {
+                        agent = (self.handle)(agent, &transition);
                     }
-                }
-            });
+                    self.agent = Some(agent);
+
+                    if let Some(action_update) = &action_update {
+                        if let Some(shell_update) = &action_update.global_shell_update {
+                            domain.update_global_knowledge(shell_update);
+                        }
+                    }
+                });
+        }
 
         let mut new_loadout = false;
         if let Some(action_update) = &action_update {
