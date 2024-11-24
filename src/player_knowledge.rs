@@ -10,6 +10,7 @@ const SHELL_GONE: f64 = 0.0;
 const SHELL_UNKNOWN: f64 = 1.0;
 const SHELL_BLANK: f64 = 2.0;
 const SHELL_LIVE: f64 = 3.0;
+pub const SHELL_STATE_MAX: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub enum ShellUpdate {
@@ -64,8 +65,18 @@ impl PlayerKnowledge {
                     }
                 }
                 GlobalShellUpdate::Inverted => match self.shells[0] {
-                    SHELL_BLANK => self.shells[0] = SHELL_LIVE,
-                    SHELL_LIVE => self.shells[0] = SHELL_BLANK,
+                    SHELL_BLANK => {
+                        self.shells[0] = {
+                            self.remaining_live_rounds += 1;
+                            SHELL_LIVE
+                        }
+                    }
+                    SHELL_LIVE => {
+                        self.shells[0] = {
+                            self.remaining_live_rounds -= 1;
+                            SHELL_BLANK
+                        }
+                    }
                     SHELL_UNKNOWN => {}
                     _ => unreachable!(),
                 },

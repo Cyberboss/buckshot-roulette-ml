@@ -9,7 +9,7 @@ pub struct SeatMap {
 
     pub own_seat_index: usize,
     pub left_seat_index: Option<usize>,
-    pub opposite_seat_index: usize,
+    pub opposite_seat_index: Option<usize>,
     pub right_seat_index: Option<usize>,
 }
 
@@ -69,7 +69,7 @@ impl SeatMap {
             right_player,
             opposite_player,
             own_seat_index: own_seat_index.unwrap(),
-            opposite_seat_index: opposite_seat_index.unwrap(),
+            opposite_seat_index: opposite_seat_index,
             left_seat_index,
             right_seat_index,
         }

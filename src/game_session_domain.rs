@@ -1,8 +1,15 @@
-use std::{cell::RefCell, ops::Index};
+use std::{
+    cell::{RefCell, RefMut},
+    cmp::{max, min},
+    ops::Index,
+};
 
 use buckshot_roulette_gameplay_engine::{
     game_session::GameSession,
-    item::{initialize_item_count_map, Item, NotAdreneline, UnaryItem, TOTAL_ITEMS},
+    item::{
+        global_item_limit, initialize_item_count_map, player_item_limit, Item, NotAdreneline,
+        UnaryItem, ALL_ITEMS, TOTAL_ITEMS, TOTAL_UNARY_ITEMS,
+    },
     loadout::MAX_SHELLS,
     player_number::PlayerNumber,
     round::{Round, RoundContinuation, TurnContinuation, TurnSummary},
@@ -14,14 +21,13 @@ use buckshot_roulette_gameplay_engine::{
 };
 use rand::Rng;
 use rsrl::{
-    control::ac,
     domains::{Action, Domain, Observation, Reward, State},
     spaces::{discrete::Ordinal, real::Interval, ProductSpace},
 };
 
 use crate::{
     game_action::{ActiveGameAction, AdrenelineItem, GameAction, TOTAL_ACTIONS},
-    player_knowledge::{GlobalShellUpdate, PlayerKnowledge, ShellUpdate},
+    player_knowledge::{GlobalShellUpdate, PlayerKnowledge, ShellUpdate, SHELL_STATE_MAX},
     relative_player::{OtherPlayer, RelativePlayer},
     seat_map::SeatMap,
 };
@@ -45,14 +51,14 @@ const REWARD_SHOOT_OTHER: f64 = 100.0;
 const REWARD_SHOOT_OTHER_BLANK: f64 = -10.0;
 const REWARD_SHOOT_OTHER_SAWN: f64 = 200.0;
 
-const NUM_ITEM_SLOTS: i32 = 8;
+const NUM_ITEM_SLOTS: u32 = 8;
 
-const STUN_GONE: i32 = 0;
-const STUN_HEALTHY: i32 = 1;
-const STUN_RECOVERING: i32 = 2;
-const STUN_STUNNED: i32 = 3;
+const STUN_HEALTHY_OR_GONE: i32 = 0;
+const STUN_RECOVERING: i32 = 1;
+const STUN_STUNNED: i32 = 2;
+const STUN_MAX: i32 = STUN_STUNNED;
 
-const MAX_HEALTH: i32 = 6;
+const MAX_HEALTH: u32 = 6;
 
 pub const TOTAL_SEATS: usize = 4;
 pub const OTHER_SEATS: usize = TOTAL_SEATS - 1;
@@ -105,7 +111,7 @@ where
         let seat_map = SeatMap::new(player_number, seats);
         let knowledge = PlayerKnowledge::new(seat_map);
 
-        GameSessionDomain {
+        let mut domain = GameSessionDomain {
             game_session,
             knowledge,
             player_number,
@@ -113,7 +119,10 @@ where
             prior_observation: None,
             shell_inverted: false,
             action_update: None,
-        }
+        };
+
+        domain.reset_knowledge();
+        domain
     }
 
     pub fn action_update(&mut self) -> Option<ActionUpdate> {
@@ -170,10 +179,9 @@ where
         }
     }
 
-    fn bad_active_game_action(&mut self) -> f64 {
+    fn bad_active_game_action(&mut self, session: &mut RefMut<GameSession<TRng>>) -> f64 {
         self.log_action(|| "Invalid action attempt!".to_string());
         let own_player = self.player_number;
-        let mut session = self.game_session.borrow_mut();
         let ejected_shell = session
             .with_turn(
                 |turn| turn.shoot(own_player),
@@ -204,17 +212,23 @@ where
         );
     }
 
-    fn item_action_available_check(&mut self, item: Item) -> Option<f64> {
-        let session = self.game_session.borrow();
-        let round = session.round().unwrap();
-
-        let seat = get_player_seat(round, self.player_number).unwrap();
-        let valid_use = seat_has_item(seat, item);
+    fn item_action_available_check(
+        &mut self,
+        session: &mut RefMut<GameSession<TRng>>,
+        item: Item,
+    ) -> Option<f64> {
+        let valid_use = match session.round() {
+            Some(round) => {
+                let seat = get_player_seat(round, self.player_number).unwrap();
+                seat_has_item(seat, item)
+            }
+            None => false,
+        };
         if valid_use {
             self.log_action(|| format!("Uses item: {}", item));
             None
         } else {
-            Some(self.bad_active_game_action())
+            Some(self.bad_active_game_action(session))
         }
     }
 }
@@ -235,21 +249,19 @@ where
     }
 
     fn emit(&self) -> Observation<State<Self>> {
-        let expected_capacity = 6 + 10 + 4 + 4 + TOTAL_ITEMS;
         let session = self.game_session.borrow();
         match session.round() {
             Some(round) => {
-                let mut state: Vec<f64> = Vec::with_capacity(expected_capacity);
-
-                state.push(match round.number() {
-                    RoundNumber::One => 1.0,
-                    RoundNumber::Two => 2.0,
-                    RoundNumber::Three => 3.0,
-                });
+                let mut state: Vec<f64> = Vec::with_capacity(STATE_SIZE);
 
                 let current_player = round.next_player();
 
-                state.push(turn_distance(current_player, self.player_number).into());
+                state.push(match current_player {
+                    PlayerNumber::One => 0.0,
+                    PlayerNumber::Two => 1.0,
+                    PlayerNumber::Three => 2.0,
+                    PlayerNumber::Four => 3.0,
+                });
 
                 let knowledge = &self.knowledge;
                 state.push(knowledge.remaining_live_rounds.into());
@@ -261,13 +273,6 @@ where
                     0.0
                 });
                 state.push(if modifiers.shotgun_sawn { 1.0 } else { 0.0 });
-                state.push(match round.number() {
-                    RoundNumber::One | RoundNumber::Two => match round.first_dead_player() {
-                        Some(player_number) => player_as_index(player_number).into(),
-                        None => 4.0,
-                    },
-                    RoundNumber::Three => 5.0,
-                });
 
                 for i in 0..knowledge.shells.len() {
                     state.push(knowledge.shells[i]);
@@ -276,64 +281,137 @@ where
                 let seats = round.seats();
                 let seat_map = &knowledge.seat_map;
                 let mut add_seat_health = |seat_index: Option<usize>| {
-                    state.push(match seat_index {
-                        Some(seat_index) => match seats[seat_index].player() {
-                            Some(player) => player.health().into(),
-                            None => 0.0,
-                        },
+                    let health = match seat_index {
+                        Some(seat_index) => {
+                            let seat = &seats[seat_index];
+                            match seat.player() {
+                                Some(player) => player.health().into(),
+                                None => {
+                                    assert_ne!(seat.player_number(), current_player);
+                                    0.0
+                                }
+                            }
+                        }
                         None => 0.0,
-                    })
+                    };
+                    state.push(health);
                 };
 
                 add_seat_health(Some(seat_map.own_seat_index));
                 add_seat_health(seat_map.left_seat_index);
-                add_seat_health(Some(seat_map.opposite_seat_index));
+                add_seat_health(seat_map.opposite_seat_index);
                 add_seat_health(seat_map.right_seat_index);
 
                 let mut add_seat_stun = |seat_index: Option<usize>| {
                     state.push(match seat_index {
                         Some(seat_index) => match seats[seat_index].player() {
                             Some(player) => match player.stun_state() {
-                                StunState::Unstunned => STUN_HEALTHY.into(),
+                                StunState::Unstunned => STUN_HEALTHY_OR_GONE.into(),
                                 StunState::Stunned => STUN_STUNNED.into(),
                                 StunState::Recovering => STUN_RECOVERING.into(),
                             },
-                            None => STUN_GONE.into(),
+                            None => STUN_HEALTHY_OR_GONE.into(),
                         },
-                        None => STUN_GONE.into(),
+                        None => STUN_HEALTHY_OR_GONE.into(),
                     })
                 };
 
                 add_seat_stun(Some(seat_map.own_seat_index));
                 add_seat_stun(seat_map.left_seat_index);
-                add_seat_stun(Some(seat_map.opposite_seat_index));
+                add_seat_stun(seat_map.opposite_seat_index);
                 add_seat_stun(seat_map.right_seat_index);
 
-                let mut add_seat_items = |seat_index: Option<usize>| {
+                let get_item_index = |item| {
+                    let result = match item {
+                        Item::NotAdreneline(not_adreneline) => match not_adreneline {
+                            NotAdreneline::UnaryItem(unary_item) => match unary_item {
+                                UnaryItem::Remote => None,
+                                UnaryItem::Phone => Some(0),
+                                UnaryItem::Inverter => Some(1),
+                                UnaryItem::MagnifyingGlass => Some(2),
+                                UnaryItem::Cigarettes => Some(3),
+                                UnaryItem::Handsaw => Some(4),
+                                UnaryItem::Beer => Some(5),
+                            },
+                            NotAdreneline::Jammer => None,
+                        },
+                        Item::Adreneline => Some(6),
+                    };
+
+                    assert_eq!(result.is_some(), item_is_globally_limited(item).is_none());
+                    result
+                };
+                let mut add_seat_non_global_items = |seat_index: Option<usize>| {
                     let seat_base_index = state.len();
-                    for _ in 0..TOTAL_ITEMS {
+                    for _ in 0..(TOTAL_ITEMS - GLOBALLY_LIMITED_ITEMS.len()) {
                         state.push(0.0);
                     }
 
                     if let Some(seat_index) = seat_index {
                         for item in seats[seat_index].items() {
-                            let index = get_item_index(item);
-                            state[seat_base_index + index] += 1.0;
+                            if let Some(index) = get_item_index(*item) {
+                                state[seat_base_index + index] += 1.0;
+                            }
                         }
                     }
                 };
 
-                add_seat_items(Some(seat_map.own_seat_index));
-                add_seat_items(seat_map.left_seat_index);
-                add_seat_items(Some(seat_map.opposite_seat_index));
-                add_seat_items(seat_map.right_seat_index);
+                add_seat_non_global_items(Some(seat_map.own_seat_index));
+                add_seat_non_global_items(seat_map.left_seat_index);
+                add_seat_non_global_items(seat_map.opposite_seat_index);
+                add_seat_non_global_items(seat_map.right_seat_index);
 
-                assert!(state.len() == expected_capacity);
+                let seat_has_item = |seat_index: Option<usize>, item| match seat_index {
+                    Some(seat_index) => seats[seat_index]
+                        .items()
+                        .iter()
+                        .any(|seat_item| *seat_item == item),
+                    None => false,
+                };
+
+                let players_that_own_item = |item, limit| {
+                    let mut result = Vec::with_capacity(limit);
+
+                    if seat_has_item(Some(seat_map.own_seat_index), item) {
+                        result.push(1.0);
+                    }
+
+                    if seat_has_item(seat_map.left_seat_index, item) {
+                        result.push(2.0);
+                    }
+
+                    if seat_has_item(seat_map.opposite_seat_index, item) {
+                        result.push(3.0);
+                    }
+
+                    if seat_has_item(seat_map.right_seat_index, item) {
+                        result.push(4.0);
+                    }
+
+                    result
+                };
+
+                for item in GLOBALLY_LIMITED_ITEMS {
+                    let global_item_limit = global_item_limit(item);
+                    let mut found = 0;
+
+                    // add player that owns globally limited item
+                    for player in players_that_own_item(item, global_item_limit) {
+                        state.push(player);
+                        found += 1;
+                    }
+
+                    for _ in found..global_item_limit {
+                        state.push(0.0);
+                    }
+                }
+
+                assert_eq!(state.len(), STATE_SIZE);
                 Observation::Full(state)
             }
             None => {
-                let mut state = Vec::with_capacity(expected_capacity);
-                for _ in 0..expected_capacity {
+                let mut state = Vec::with_capacity(STATE_SIZE);
+                for _ in 0..STATE_SIZE {
                     state.push(0.0);
                 }
 
@@ -345,7 +423,13 @@ where
     fn step(&mut self, a: &Action<Self>) -> (Observation<State<Self>>, Reward) {
         assert!(self.action_update.is_none());
         let mut session = self.game_session.borrow_mut();
-        let round = session.round().unwrap();
+        let round = match session.round() {
+            Some(round) => round,
+            None => {
+                drop(session);
+                return (self.emit(), REWARD_ROUND_LOSS);
+            }
+        };
         let current_player = round.next_player();
         let own_player = self.player_number;
 
@@ -363,8 +447,12 @@ where
                 } else {
                     let current_player_health = get_player_health(round, own_player);
                     let delta = prior_observation.prior_health - current_player_health;
-                    assert!(current_player_health <= prior_observation.prior_health);
-                    REWARD_LOST_HEALTH * f64::from(delta)
+                    if current_player_health == 0 && prior_observation.prior_health > 0 {
+                        REWARD_ROUND_LOSS
+                    } else {
+                        assert!(current_player_health <= prior_observation.prior_health);
+                        REWARD_LOST_HEALTH * f64::from(delta)
+                    }
                 }
             }
             GameAction::Act(active_game_action) => {
@@ -430,20 +518,41 @@ where
                                                         self.log_summary(summary);
                                                         let shot_result =
                                                             summary.shot_result.as_ref().unwrap();
-                                                        match shot_result.damage {
-                                                            ShotgunDamage::Blank => (
-                                                                GlobalShellUpdate::Ejected(
-                                                                    ShellType::Blank,
+                                                        let (ejected_shell, damage_reward) =
+                                                            match shot_result.damage {
+                                                                ShotgunDamage::Blank => (
+                                                                    GlobalShellUpdate::Ejected(
+                                                                        ShellType::Blank,
+                                                                    ),
+                                                                    REWARD_SHOOT_OTHER_BLANK,
                                                                 ),
-                                                                REWARD_SHOOT_OTHER_BLANK,
-                                                            ),
-                                                            ShotgunDamage::RegularShot(_)
-                                                            | ShotgunDamage::SawedShot(_) => (
-                                                                GlobalShellUpdate::Ejected(
-                                                                    ShellType::Live,
+                                                                ShotgunDamage::RegularShot(_) => (
+                                                                    GlobalShellUpdate::Ejected(
+                                                                        ShellType::Live,
+                                                                    ),
+                                                                    REWARD_SHOOT_OTHER,
                                                                 ),
-                                                                REWARD_SHOOT_OTHER,
-                                                            ),
+                                                                ShotgunDamage::SawedShot(
+                                                                    killed,
+                                                                ) => (
+                                                                    GlobalShellUpdate::Ejected(
+                                                                        ShellType::Live,
+                                                                    ),
+                                                                    // don't overeward overkill
+                                                                    if killed {
+                                                                        REWARD_SHOOT_OTHER
+                                                                    } else {
+                                                                        REWARD_SHOOT_OTHER_SAWN
+                                                                    },
+                                                                ),
+                                                            };
+
+                                                        if let RoundContinuation::RoundEnds(_) =
+                                                            summary.round_continuation
+                                                        {
+                                                            (ejected_shell, REWARD_ROUND_WIN)
+                                                        } else {
+                                                            (ejected_shell, damage_reward)
                                                         }
                                                     },
                                                 )
@@ -455,23 +564,25 @@ where
                                             });
                                             reward
                                         }
-                                        None => self.bad_active_game_action(),
+                                        None => self.bad_active_game_action(&mut session),
                                     },
-                                    None => self.bad_active_game_action(),
+                                    None => self.bad_active_game_action(&mut session),
                                 }
                             }
                         },
                         ActiveGameAction::UnaryItem(unary_item) => {
-                            let reward = self.item_action_available_check(Item::NotAdreneline(
-                                NotAdreneline::UnaryItem(unary_item),
-                            ));
+                            let reward = self.item_action_available_check(
+                                &mut session,
+                                Item::NotAdreneline(NotAdreneline::UnaryItem(unary_item)),
+                            );
+                            let round = session.round().unwrap();
                             match reward {
                                 Some(reward) => reward,
                                 None => {
                                     if unary_item == UnaryItem::Handsaw
                                         && round.game_modifiers().shotgun_sawn
                                     {
-                                        self.bad_active_game_action()
+                                        self.bad_active_game_action(&mut session)
                                     } else {
                                         let mut shell_update = None;
                                         session
@@ -495,7 +606,7 @@ where
                                                                 ItemUseResult::ShotgunRacked(shotgun_rack_result) => Some(ShellUpdate::Global(GlobalShellUpdate::Ejected(shotgun_rack_result.ejected_shell_type))),
                                                                 ItemUseResult::Default | ItemUseResult::LearnedShell(_) | ItemUseResult::StunnedPlayer(_) => unreachable!(),
                                                             },
-                                                            TerminalAction::Shot(_) => unreachable!()
+                                                            TerminalAction::Shot(_) => unreachable!("Bad terminal action!")
                                                         }
                                                     }
                                                 };
@@ -546,9 +657,11 @@ where
                             }
                         }
                         ActiveGameAction::Jammer(other_player) => {
-                            let reward = self.item_action_available_check(Item::NotAdreneline(
-                                NotAdreneline::Jammer,
-                            ));
+                            let reward = self.item_action_available_check(
+                                &mut session,
+                                Item::NotAdreneline(NotAdreneline::Jammer),
+                            );
+                            let round = session.round().unwrap();
                             match reward {
                                 Some(reward) => reward,
                                 None => match get_other_player(round, &seat_map, other_player) {
@@ -575,17 +688,19 @@ where
                                                 REWARD_ITEM_GENERIC
                                             }
                                             StunState::Stunned | StunState::Recovering => {
-                                                self.bad_active_game_action()
+                                                self.bad_active_game_action(&mut session)
                                             }
                                         },
-                                        None => self.bad_active_game_action(),
+                                        None => self.bad_active_game_action(&mut session),
                                     },
-                                    None => self.bad_active_game_action(),
+                                    None => self.bad_active_game_action(&mut session),
                                 },
                             }
                         }
                         ActiveGameAction::Adreneline(adreneline_target) => {
-                            let reward = self.item_action_available_check(Item::Adreneline);
+                            let reward =
+                                self.item_action_available_check(&mut session, Item::Adreneline);
+                            let round = session.round().unwrap();
                             match reward {
                                 Some(reward) => reward,
                                 None => {
@@ -610,7 +725,9 @@ where
                                                         if unary_item == UnaryItem::Handsaw
                                                             && round.game_modifiers().shotgun_sawn
                                                         {
-                                                            self.bad_active_game_action()
+                                                            self.bad_active_game_action(
+                                                                &mut session,
+                                                            )
                                                         } else {
                                                             self.log_action(|| format!("Using {} stolen from player {}", Item::NotAdreneline(NotAdreneline::UnaryItem(unary_item)), theive_from));
                                                             session
@@ -651,22 +768,26 @@ where
                                                                             REWARD_ITEM_GENERIC
                                                                         }
                                                                         StunState::Stunned | StunState::Recovering => {
-                                                                            self.bad_active_game_action()
+                                                                            self.bad_active_game_action(
+                                                                                &mut session,)
                                                                         }
                                                                     },
                                                                     None => self
-                                                                        .bad_active_game_action(),
+                                                                        .bad_active_game_action(
+                                                                            &mut session,),
                                                                 }
                                                             }
-                                                            None => self.bad_active_game_action(),
+                                                            None => self.bad_active_game_action(
+                                                                &mut session,
+                                                            ),
                                                         }
                                                     }
                                                 }
                                             } else {
-                                                self.bad_active_game_action()
+                                                self.bad_active_game_action(&mut session)
                                             }
                                         }
-                                        None => self.bad_active_game_action(),
+                                        None => self.bad_active_game_action(&mut session),
                                     }
                                 }
                             }
@@ -675,83 +796,138 @@ where
                 }
             }
         };
+
+        drop(session);
         (self.emit(), reward)
     }
 }
 
-pub fn state_space_static() -> ProductSpace<Interval> {
-    let mut space = ProductSpace::empty();
+struct SpaceBuilder {
+    space: ProductSpace<Interval>,
+    total_variables: usize,
+}
 
-    // round number or 0 for complete
-    space = space + Interval::bounded(0.0, 3.0);
+impl SpaceBuilder {
+    fn add_range(&mut self, limit_inclusive: u32) {
+        self.add_range_with_lower_bound(0, limit_inclusive);
+    }
+
+    fn add_range_with_lower_bound(&mut self, lower_bound: u32, upper_bound: u32) {
+        self.space = self.space.clone() + Interval::bounded(lower_bound.into(), upper_bound.into());
+        self.total_variables += 1;
+    }
+}
+
+const STATE_SIZE: usize = 52;
+
+#[test]
+fn test_state_size() {
+    state_space_static();
+}
+
+pub fn state_space_static() -> ProductSpace<Interval> {
+    let mut builder = SpaceBuilder {
+        space: ProductSpace::empty(),
+        total_variables: 0,
+    };
 
     // turn calculator with 0 being current player
-    space = space + Interval::bounded(0.0, 4.0);
+    builder.add_range(3);
 
     // knowledge of number of remaining live shells
-    space = space + Interval::bounded(0.0, 9.0);
+    builder.add_range(7);
 
     // inversion bit
-    space = space + Interval::bounded(0.0, 1.0);
+    builder.add_range(1);
 
     // turn order inversion bit
-    space = space + Interval::bounded(0.0, 1.0);
+    builder.add_range(1);
 
     // sawn bit
-    space = space + Interval::bounded(0.0, 1.0);
+    builder.add_range(1);
 
-    // player to go in next round 4: undetermined, 5: N/A
-    space = space + Interval::bounded(0.0, 6.0);
-
-    // knowledge of all ten shells positions starting with what's chambered
+    // knowledge of all shell position starting with what's chambered
     for _ in 0..MAX_SHELLS {
         // all 4 states
-        space = space + Interval::bounded(0.0, 3.0); // total shells remaining
+        builder.add_range(SHELL_STATE_MAX); // total shells remaining
     }
 
     // health of self
-    space = space + Interval::bounded(1.0, 6.0);
+    builder.add_range_with_lower_bound(1, MAX_HEALTH);
 
-    // health of other seats
+    // health/presence of other seats
     for _ in 0..OTHER_SEATS {
-        space = space + Interval::bounded(0.0, MAX_HEALTH.into());
+        builder.add_range(MAX_HEALTH);
     }
 
-    // stun state of other seats
+    // stun state of all seats
     for _ in 0..TOTAL_SEATS {
-        space = space + Interval::bounded(0.0, 3.0);
+        builder.add_range(STUN_MAX.try_into().unwrap());
     }
 
-    // count of each item for all 4 seats
-    for _ in 0..TOTAL_ITEMS {
-        for _ in 0..TOTAL_SEATS {
-            space = space + Interval::bounded(0.0, NUM_ITEM_SLOTS.into());
+    // count of each non-globally limited item for all 4 seats
+    for _ in 0..TOTAL_SEATS {
+        for item in ALL_ITEMS {
+            if item_is_globally_limited(item).is_some() {
+                continue;
+            }
+
+            builder.add_range(player_max_of_item(item));
         }
     }
 
-    space
+    // for each globally limited item
+    for item in ALL_ITEMS {
+        if let Some(global_limit) = item_is_globally_limited(item) {
+            // indicate the player that has it, 0 being none
+            for _ in 0..global_limit {
+                builder.add_range(4);
+            }
+        }
+    }
+
+    assert_eq!(STATE_SIZE, builder.total_variables);
+
+    builder.space
+}
+
+const GLOBALLY_LIMITED_ITEMS: [Item; 2] = [
+    Item::NotAdreneline(NotAdreneline::UnaryItem(UnaryItem::Remote)),
+    Item::NotAdreneline(NotAdreneline::Jammer),
+];
+
+fn item_is_globally_limited(item: Item) -> Option<usize> {
+    let limit = global_item_limit(item);
+    if limit < max_items_on_table() {
+        Some(limit)
+    } else {
+        None
+    }
+}
+
+#[test]
+fn test_globally_limited_items() {
+    let mut limited = 0;
+    for item in ALL_ITEMS {
+        if let Some(_) = item_is_globally_limited(item) {
+            limited += 1;
+        }
+    }
+
+    assert_eq!(limited, GLOBALLY_LIMITED_ITEMS.len());
+}
+
+fn max_items_on_table() -> usize {
+    let max_items_per_player: usize = NUM_ITEM_SLOTS.try_into().unwrap();
+    TOTAL_SEATS * max_items_per_player
+}
+
+fn player_max_of_item(item: Item) -> u32 {
+    min(player_item_limit(item).try_into().unwrap(), NUM_ITEM_SLOTS)
 }
 
 pub fn action_space_static() -> Ordinal {
     Ordinal::new(TOTAL_ACTIONS)
-}
-
-fn get_item_index(item: &Item) -> usize {
-    match item {
-        Item::NotAdreneline(not_adreneline) => match not_adreneline {
-            NotAdreneline::UnaryItem(unary_item) => match unary_item {
-                UnaryItem::Remote => 0,
-                UnaryItem::Phone => 1,
-                UnaryItem::Inverter => 2,
-                UnaryItem::MagnifyingGlass => 3,
-                UnaryItem::Cigarettes => 4,
-                UnaryItem::Handsaw => 5,
-                UnaryItem::Beer => 6,
-            },
-            NotAdreneline::Jammer => 7,
-        },
-        Item::Adreneline => 8,
-    }
 }
 
 fn turn_distance(current: PlayerNumber, target: PlayerNumber) -> i32 {
@@ -797,7 +973,7 @@ where
 
     let index = match other_player {
         OtherPlayer::Left => seat_map.left_seat_index,
-        OtherPlayer::Opposite => Some(seat_map.opposite_seat_index),
+        OtherPlayer::Opposite => seat_map.opposite_seat_index,
         OtherPlayer::Right => seat_map.right_seat_index,
     };
 

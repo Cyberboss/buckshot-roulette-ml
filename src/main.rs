@@ -7,7 +7,10 @@ mod player_knowledge;
 mod relative_player;
 mod seat_map;
 
-use std::cell::RefCell;
+use std::{
+    cell::RefCell,
+    hash::{BuildHasher, DefaultHasher, RandomState},
+};
 
 use buckshot_roulette_gameplay_engine::{
     game_session::GameSession, multiplayer_count::MultiplayerCount, player_number::PlayerNumber,
@@ -19,7 +22,7 @@ use rsrl::{
     control::td::SARSALambda,
     domains::Domain,
     fa::linear::{
-        basis::{Combinators, Fourier},
+        basis::{Combinators, Fourier, TileCoding},
         optim::SGD,
         LFA,
     },
@@ -35,15 +38,27 @@ const ALPHA: f64 = 0.01;
 const GAMMA: f64 = 0.99;
 const LAMBDA: f64 = 0.7;
 
+struct DeterministicHasher {}
+
+impl BuildHasher for DeterministicHasher {
+    type Hasher = DefaultHasher;
+
+    fn build_hasher(&self) -> DefaultHasher {
+        DefaultHasher::new()
+    }
+}
+
 fn main() {
     let mut rng = StdRng::seed_from_u64(0);
     let mut agent = {
         let n_actions = action_space_static().card().into();
 
-        let test_card = state_space_static().card();
-        let test_dim = state_space_static().dim();
+        let memory_size = 1024 * 1024;
 
-        let basis = Fourier::from_space(5, state_space_static()).with_bias();
+        let s = DeterministicHasher {};
+        let basis = TileCoding::new(s, 1000, memory_size).with_bias();
+
+        // let basis = Fourier::from_space(5, state_space_static()).with_bias();
         let fa_theta = make_shared(LFA::vector(basis, SGD(1.0), n_actions));
 
         let policy = EpsilonGreedy::new(Greedy::new(fa_theta.clone()), Random::new(n_actions), 0.2);
@@ -82,11 +97,11 @@ fn main() {
                 (agent, rng)
             },
             true,
-            false,
+            true,
         );
 
-        controller.register_domain(PlayerNumber::One, false);
-        controller.register_domain(PlayerNumber::Two, false);
+        controller.register_domain(PlayerNumber::One, true);
+        controller.register_domain(PlayerNumber::Two, true);
 
         for i in 0.. {
             j = i;

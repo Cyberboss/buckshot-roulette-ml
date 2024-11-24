@@ -47,7 +47,7 @@ where
             enable_updates,
             enable_logging,
         };
-        controller.log_loadout(true);
+        controller.log_loadout(Some(true));
         controller
     }
 
@@ -101,6 +101,7 @@ where
             .for_each(|(_, domain)| {
                 let (sample, mut agent) = (self.sample)(self.agent.take().unwrap(), &domain);
                 let transition = domain.transition(sample);
+                domain.action_update();
                 if self.enable_updates {
                     agent = (self.handle)(agent, &transition);
                 }
@@ -118,40 +119,41 @@ where
             new_loadout = action_update.new_loadout
         }
 
-        let new_round = match self.session.borrow().round() {
-            Some(round) => round.number() != starting_round,
-            None => true,
+        let new_round_option = match self.session.borrow().round() {
+            Some(round) => Some(round.number() != starting_round),
+            None => None,
         };
 
+        let new_round = new_round_option.is_none_or(|new_round| new_round);
+
         if new_loadout || new_round {
-            self.log_loadout(new_round);
+            self.log_loadout(new_round_option);
         }
 
         new_round && self.session.borrow().round().is_none()
     }
 
-    fn log_loadout(&mut self, new_round: bool) {
-        self.domains
-            .iter_mut()
-            .for_each(|(_, domain)| domain.reset_knowledge());
+    fn log_loadout(&mut self, new_round: Option<bool>) {
+        if new_round.is_some() {
+            self.domains
+                .iter_mut()
+                .for_each(|(_, domain)| domain.reset_knowledge());
+        }
 
         if !self.enable_logging {
             return;
         }
         let session = self.session.borrow();
         let round = session.round();
-        if new_round {
-            println!(
+        match new_round {
+            Some(_) => println!(
                 "Starting round: {}",
                 match round {
                     Some(round) => format!("{}", round.number()),
-                    None => "End of game!".to_string(),
+                    None => unreachable!("There should be a round here"),
                 }
-            );
-
-            if round.is_none() {
-                return;
-            }
+            ),
+            None => return,
         }
 
         let round = round.unwrap();
@@ -164,7 +166,9 @@ where
         for i in 0..loadout.new_items {
             for player in round.living_players() {
                 let items = player.items();
-                let item_to_log = &items[(items.len() - (loadout.new_items - i)) - 1];
+                let player_items = items.len();
+                let offset_of_new_items = player_items - loadout.new_items;
+                let item_to_log = &items[offset_of_new_items + i];
                 println!("Player {} grabs {}", player.player_number(), item_to_log);
             }
         }

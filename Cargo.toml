@@ -8,9 +8,13 @@ description = "A machine learning application for the game Buckshot Roulette"
 license = "GPL-3.0-or-later"
 readme = "README.md"
 
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = true
 
 [dependencies]
-buckshot-roulette-gameplay-engine = "5.4.0"
+buckshot-roulette-gameplay-engine = "5.5.0"
 blas-src = { version = "0.4", features = ["openblas"] }
 openblas-src = { version = "0.7", features = ["static"] }
 rsrl = { version = "0.8.1", features = ["blas"] }
