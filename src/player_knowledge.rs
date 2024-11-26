@@ -78,7 +78,10 @@ impl PlayerKnowledge {
                         }
                     }
                     SHELL_UNKNOWN => {}
-                    _ => unreachable!(),
+                    shell_knowledge => unreachable!(
+                        "We should not be inverting an empty shotgun: {}",
+                        shell_knowledge
+                    ),
                 },
             },
             ShellUpdate::Learned(learned_shell) => {

@@ -97,11 +97,11 @@ fn main() {
                 (agent, rng)
             },
             true,
-            true,
+            false,
         );
 
-        controller.register_domain(PlayerNumber::One, true);
-        controller.register_domain(PlayerNumber::Two, true);
+        controller.register_domain(PlayerNumber::One, false);
+        controller.register_domain(PlayerNumber::Two, false);
 
         for i in 0.. {
             j = i;

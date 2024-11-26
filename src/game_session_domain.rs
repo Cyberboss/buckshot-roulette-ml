@@ -74,6 +74,7 @@ fn generate_master_item_list() -> Vec<Item> {
 struct PriorObservation {
     observation: Observation<Vec<f64>>,
     prior_health: i32,
+    current_player: PlayerNumber,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +86,7 @@ pub struct GameSessionDomain<'session, TRng> {
     shell_inverted: bool,
     logging_enabled: bool,
     action_update: Option<ActionUpdate>,
+    pending_knowledge_update: Option<ShellUpdate>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -120,6 +122,7 @@ where
             prior_observation: None,
             shell_inverted: false,
             action_update: None,
+            pending_knowledge_update: None,
         };
 
         domain.reset_knowledge();
@@ -150,7 +153,7 @@ where
     fn log_summary(&mut self, summary: &TurnSummary<TRng>) {
         if let RoundContinuation::RoundContinues(continuation) = &summary.round_continuation {
             if let TurnContinuation::LoadoutEnds(_) = &continuation.turn_continuation {
-                self.set_action_update(|update| update.new_loadout = true);
+                self.set_action_update(|update: &mut ActionUpdate| update.new_loadout = true);
             }
         }
 
@@ -159,8 +162,8 @@ where
         }
     }
 
-    pub fn update_global_knowledge(&mut self, update: &GlobalShellUpdate) {
-        self.knowledge.update(ShellUpdate::Global(*update));
+    pub fn prime_knowledge_update(&mut self, update: &GlobalShellUpdate) {
+        self.pending_knowledge_update = Some(ShellUpdate::Global(*update));
     }
 
     pub fn pre_action_observe(&mut self) -> bool {
@@ -173,6 +176,7 @@ where
                 self.prior_observation = Some(PriorObservation {
                     observation: self.emit(),
                     prior_health,
+                    current_player: round.next_player(),
                 });
                 return round.next_player() == self.player_number;
             }
@@ -250,6 +254,10 @@ where
     }
 
     fn emit(&self) -> Observation<State<Self>> {
+        if let Some(prior_observation) = &self.prior_observation {
+            return prior_observation.observation.clone();
+        }
+
         let session = self.game_session.borrow();
         match session.round() {
             Some(round) => {
@@ -425,13 +433,17 @@ where
         assert!(self.action_update.is_none());
         let mut session = self.game_session.borrow_mut();
         let round = session.round().unwrap();
-        let current_player = round.next_player();
         let own_player = self.player_number;
 
         // first validate the action
         let action = GameAction::parse(*a);
 
         let prior_observation = self.prior_observation.take().unwrap();
+        let current_player = prior_observation.current_player;
+
+        if let Some(pending_knowledge_update) = self.pending_knowledge_update.take() {
+            self.knowledge.update(pending_knowledge_update);
+        }
 
         let seat_map = self.knowledge.seat_map.clone();
         let reward = match action {
@@ -445,7 +457,7 @@ where
                     if current_player_health == 0 && prior_observation.prior_health > 0 {
                         REWARD_ROUND_LOSS
                     } else {
-                        assert!(current_player_health <= prior_observation.prior_health);
+                        assert!(delta >= 0);
                         REWARD_LOST_HEALTH * f64::from(delta)
                     }
                 }
@@ -570,12 +582,11 @@ where
                                 &mut session,
                                 Item::NotAdreneline(NotAdreneline::UnaryItem(unary_item)),
                             );
-                            let round = session.round().unwrap();
                             match reward {
                                 Some(reward) => reward,
                                 None => {
                                     if unary_item == UnaryItem::Handsaw
-                                        && round.game_modifiers().shotgun_sawn
+                                        && session.round().unwrap().game_modifiers().shotgun_sawn
                                     {
                                         self.bad_active_game_action(&mut session)
                                     } else {
@@ -623,12 +634,11 @@ where
                                                 ShellUpdate::Learned(_) => {
                                                     self.knowledge.update(shell_update)
                                                 }
-                                                ShellUpdate::Global(global_shell_update) => {
-                                                    self.set_action_update(|update| {
+                                                ShellUpdate::Global(global_shell_update) => self
+                                                    .set_action_update(|update| {
                                                         update.global_shell_update =
                                                             Some(global_shell_update)
-                                                    });
-                                                }
+                                                    }),
                                             };
                                         }
 
@@ -656,10 +666,13 @@ where
                                 &mut session,
                                 Item::NotAdreneline(NotAdreneline::Jammer),
                             );
-                            let round = session.round().unwrap();
                             match reward {
                                 Some(reward) => reward,
-                                None => match get_other_player(round, &seat_map, other_player) {
+                                None => match get_other_player(
+                                    session.round().unwrap(),
+                                    &seat_map,
+                                    other_player,
+                                ) {
                                     Some(target_seat) => match target_seat.player() {
                                         Some(target_player) => match target_player.stun_state() {
                                             StunState::Unstunned => {
@@ -695,10 +708,10 @@ where
                         ActiveGameAction::Adreneline(adreneline_target) => {
                             let reward =
                                 self.item_action_available_check(&mut session, Item::Adreneline);
-                            let round = session.round().unwrap();
                             match reward {
                                 Some(reward) => reward,
                                 None => {
+                                    let round = session.round().unwrap();
                                     match get_other_player(
                                         round,
                                         &seat_map,

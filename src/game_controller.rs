@@ -100,19 +100,23 @@ where
                 .iter_mut()
                 .filter(|(player_number, _)| **player_number != acting_player)
                 .for_each(|(_, domain)| {
+                    if let Some(action_update) = &action_update {
+                        if let Some(shell_update) = &action_update.global_shell_update {
+                            domain.prime_knowledge_update(shell_update);
+                        }
+                    }
+
                     let (sample, mut agent) = (self.sample)(self.agent.take().unwrap(), &domain);
                     let transition = domain.transition(sample);
-                    domain.action_update();
+                    let action_update = domain.action_update();
+                    assert!(match action_update {
+                        Some(action_update) => action_update.global_shell_update.is_none(),
+                        None => true,
+                    });
                     if self.enable_updates {
                         agent = (self.handle)(agent, &transition);
                     }
                     self.agent = Some(agent);
-
-                    if let Some(action_update) = &action_update {
-                        if let Some(shell_update) = &action_update.global_shell_update {
-                            domain.update_global_knowledge(shell_update);
-                        }
-                    }
                 });
         }
 
@@ -201,6 +205,6 @@ where
     fn update_knowledge(&mut self, update: GlobalShellUpdate) {
         self.domains
             .iter_mut()
-            .for_each(|(_, domain)| domain.update_global_knowledge(&update));
+            .for_each(|(_, domain)| domain.prime_knowledge_update(&update));
     }
 }
