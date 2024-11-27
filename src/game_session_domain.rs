@@ -2,6 +2,7 @@ use std::{
     cell::{RefCell, RefMut},
     cmp::{max, min},
     ops::Index,
+    os::unix::process,
 };
 
 use buckshot_roulette_gameplay_engine::{
@@ -73,7 +74,8 @@ fn generate_master_item_list() -> Vec<Item> {
 #[derive(Debug, Clone)]
 struct PriorObservation {
     observation: Observation<Vec<f64>>,
-    prior_health: i32,
+    health: i32,
+    round: RoundNumber,
     current_player: PlayerNumber,
 }
 
@@ -175,8 +177,9 @@ where
                 let prior_health = get_player_health(round, self.player_number);
                 self.prior_observation = Some(PriorObservation {
                     observation: self.emit(),
-                    prior_health,
+                    health: prior_health,
                     current_player: round.next_player(),
+                    round: round.number(),
                 });
                 return round.next_player() == self.player_number;
             }
@@ -453,11 +456,32 @@ where
                     REWARD_INVALID_ACTION
                 } else {
                     let current_player_health = get_player_health(round, own_player);
-                    let delta = prior_observation.prior_health - current_player_health;
-                    if current_player_health == 0 && prior_observation.prior_health > 0 {
+                    let delta = prior_observation.health - current_player_health;
+                    let was_alive = prior_observation.health > 0;
+                    if prior_observation.round != round.number() && was_alive {
+                        // determine if they won or lost
+                        let won_round = session
+                            .players()
+                            .as_vec()
+                            .iter()
+                            .find(|player| player.number() == own_player)
+                            .unwrap()
+                            .wins()
+                            .contains(&prior_observation.round);
+                        if won_round {
+                            REWARD_ROUND_WIN
+                        } else {
+                            REWARD_ROUND_LOSS
+                        }
+                    } else if current_player_health == 0 && was_alive {
                         REWARD_ROUND_LOSS
                     } else {
-                        assert!(delta >= 0);
+                        if delta < 0 {
+                            panic!(
+                                "Invalid current/prior health: {} {}",
+                                current_player_health, prior_observation.health
+                            )
+                        }
                         REWARD_LOST_HEALTH * f64::from(delta)
                     }
                 }
@@ -647,9 +671,7 @@ where
                                                 session.round().unwrap(),
                                                 own_player,
                                             );
-                                            if prior_observation.prior_health
-                                                == current_player_health
-                                            {
+                                            if prior_observation.health == current_player_health {
                                                 REWARD_USELESS_SMOKE
                                             } else {
                                                 REWARD_GAIN_HEALTH

@@ -17,7 +17,7 @@ use buckshot_roulette_gameplay_engine::{
 };
 use game_controller::GameController;
 use game_session_domain::{action_space_static, state_space_static};
-use rand::{rngs::StdRng, RngCore, SeedableRng};
+use rand::{rngs::StdRng, Rng, RngCore, SeedableRng};
 use rsrl::{
     control::td::SARSALambda,
     domains::Domain,
@@ -50,13 +50,15 @@ impl BuildHasher for DeterministicHasher {
 
 fn main() {
     let mut rng = StdRng::seed_from_u64(0);
+    assert_eq!(247, rng.gen_range(69, 420));
     let mut agent = {
         let n_actions = action_space_static().card().into();
 
-        let memory_size = 1024;
+        let n_tilings = 64;
+        let memory_size = 65536;
 
         let s = DeterministicHasher {};
-        let basis = TileCoding::new(s, 1000, memory_size).with_bias();
+        let basis = TileCoding::new(s, n_tilings, memory_size);
 
         // let basis = Fourier::from_space(5, state_space_static()).with_bias();
         let fa_theta = make_shared(LFA::vector(basis, SGD(1.0), n_actions));
